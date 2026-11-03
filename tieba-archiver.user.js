@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         贴吧存档助手（TiebaArchiver 浏览器版）
 // @namespace    tieba-archiver-browser
-// @version      1.5.0
+// @version      1.6.0
 // @description  在贴吧帖子页抓取主题帖、全部楼层与楼中楼，导出为完整 JSON 或用于 AI 分析的 Lite 文本
 // @author       tieba-ex
 // @match        https://tieba.baidu.com/p/*
@@ -31,6 +31,17 @@
  * - 不下载图片/视频/语音/头像，仅在 JSON 中保留原始链接与元数据。
  * - 输出为单个 JSON，结构对应原工具的 threads/<tid>/ 目录（thread.json、forum.json、post 表、user 表）。
  *
+ * 1.6.0 更新（Lite 1.2）：
+ * - 表头：新增 op=楼主名[Lv,属地]，以及主帖热度 views / likes(+赞/-踩) / shares。
+ * - 点赞字段保留点踩：+赞/-踩；只有踩时写作 0/-n；都没有仍为 -。
+ * - 用户名后挂本吧等级 [LvN]（未知/0 级省略），便于鉴别小号与老吧友。
+ * - 楼主发言统一写 [OP]，回复楼主写 @[OP]，全名只在表头 op= 出现一次。
+ * - IP 属地统一从全帖用户表回填（楼中楼接口的用户常常没有 IP）。
+ * - 图片：分割线/横条写 [line]；其余写 [img:短哈希]，同一张图哈希相同（出现冲突时自动加长）。
+ * - 时间省略与帖子创建时间同年的年份（MM-DD HH:mm），跨年的发言保留完整年份。
+ * - 签名档：同一用户的同一签名只在首次出现处保留 [sign:…]。
+ * - 图片哈希在 cdnSrc 取不到时回退到原图地址。
+ *
  * 1.5.0 更新：
  * - 楼中楼在 JSON 与 Lite 中统一按时间正序（修复：首页内联的楼中楼原为按赞排序，未经重排）。
  * - Lite 1.1：楼中楼增加序号与点赞数；楼主标 [OP]；
@@ -41,7 +52,7 @@
 (() => {
     "use strict";
 
-    const APP_VERSION = "browser-1.5.0";
+    const APP_VERSION = "browser-1.6.0";
     const APP_HOST = "https://tiebac.baidu.com";
     const BOUNDARY = "-*_r1999";
     const PAGE_CMD = 302001;
@@ -644,7 +655,7 @@
                     origin_size: content.originSize,
                     show_width: size.width,
                     show_height: size.height,
-                    hash: imageHash(content.cdnSrc),
+                    hash: imageHash(content.cdnSrc) || imageHash(content.originSrc),
                 };
             }
 
@@ -1453,13 +1464,29 @@
             .slice(0, 120);
     }
 
-    function formatLiteTime(timestamp) {
+    // ---------------------------------------------------------------------------
+    // Lite 文本（少 Token，给 AI 分析用）
+    // ---------------------------------------------------------------------------
+
+    const LITE_VERSION = "1.2";
+    const LITE_CONFIG = {
+        imgHashMin: 4, // 图片短哈希的最小长度；不同图片前缀冲突时自动加长
+        imgHashMax: 12,
+        dividerMaxHeight: 20, // 横条图片高度（像素）不超过该值 → 视为分割线
+        dividerMinRatio: 4, // 宽 / 高 不小于该值才算「横条」
+        dividerMaxBytes: 1000, // 横条图片体积小于该字节数 → 视为分割线
+        signMaxLength: 40, // 签名档最多保留的字数
+    };
+
+    // timestamp 为 Unix 秒；baseYear 非空且与发言同年时省略年份（MM-DD HH:mm），否则输出完整日期
+    function formatLiteTime(timestamp, baseYear) {
         const value = Number(timestamp);
         if (!value) {
             return "-";
         }
         const date = new Date((value + 8 * 3600) * 1000);
-        return date.toISOString().slice(0, 16).replace("T", " ");
+        const full = date.toISOString().slice(0, 16).replace("T", " ");
+        return baseYear && full.startsWith(`${baseYear}-`) ? full.slice(5) : full;
     }
 
     function sanitizeLiteText(rawText) {
@@ -1479,7 +1506,46 @@
         return text.trim() || "-";
     }
 
-    function renderLiteContent(contents) {
+    // 排版用的分割线图：又扁又长（如 560x8、几百字节），不是正经配图
+    function isDividerImage(fragment) {
+        const width = Number(fragment.show_width) || 0;
+        const height = Number(fragment.show_height) || 0;
+        if (height <= 0 || width < height * LITE_CONFIG.dividerMinRatio) {
+            return false;
+        }
+        if (height <= LITE_CONFIG.dividerMaxHeight) {
+            return true;
+        }
+        const bytes = Number(fragment.origin_size) || 0;
+        return bytes > 0 && bytes < LITE_CONFIG.dividerMaxBytes;
+    }
+
+    // 选择最短的哈希前缀长度，使全帖不同图片的前缀互不相同（同一张图前缀必然相同）
+    function pickImageHashLength(posts) {
+        const hashes = new Set();
+        const visit = (contents) => {
+            for (const fragment of contents || []) {
+                if (fragment.type === FRAGMENT_TYPE.IMAGE && fragment.hash && !isDividerImage(fragment)) {
+                    hashes.add(fragment.hash);
+                }
+            }
+        };
+        for (const post of posts) {
+            visit(post.contents);
+            for (const comment of post.comments || []) {
+                visit(comment.contents);
+            }
+        }
+        for (let length = LITE_CONFIG.imgHashMin; length < LITE_CONFIG.imgHashMax; length += 1) {
+            const prefixes = new Set([...hashes].map((hash) => hash.slice(0, length)));
+            if (prefixes.size === hashes.size) {
+                return length;
+            }
+        }
+        return LITE_CONFIG.imgHashMax;
+    }
+
+    function renderLiteContent(contents, hashLength) {
         let text = "";
         for (const fragment of contents || []) {
             switch (fragment.type) {
@@ -1491,7 +1557,13 @@
                     text += fragment.desc ? `[emoji:${fragment.desc}]` : "[emoji]";
                     break;
                 case FRAGMENT_TYPE.IMAGE:
-                    text += "[img]";
+                    if (isDividerImage(fragment)) {
+                        text += "[line]";
+                    } else if (fragment.hash) {
+                        text += `[img:${fragment.hash.slice(0, hashLength)}]`;
+                    } else {
+                        text += "[img]";
+                    }
                     break;
                 case FRAGMENT_TYPE.LINK:
                     text += fragment.title ? `[link:${fragment.title}]` : "[link]";
@@ -1507,6 +1579,38 @@
             }
         }
         return sanitizeLiteText(text);
+    }
+
+    // 点赞/点踩：+赞 | +赞/-踩 | 0/-踩 | -（都没有）
+    function likesField(agree, disagree) {
+        const up = Number(agree) || 0;
+        const down = Number(disagree) || 0;
+        if (up > 0 && down > 0) {
+            return `+${up}/-${down}`;
+        }
+        if (up > 0) {
+            return `+${up}`;
+        }
+        if (down > 0) {
+            return `0/-${down}`;
+        }
+        return "-";
+    }
+
+    function cleanSign(sign) {
+        const text = String(sign || "")
+            .replace(/\s+/g, " ")
+            .replace(/\|/g, "｜")
+            .replace(/\[/g, "【")
+            .replace(/\]/g, "】")
+            .trim();
+        if (!text) {
+            return "";
+        }
+        const chars = Array.from(text);
+        return chars.length > LITE_CONFIG.signMaxLength
+            ? `${chars.slice(0, LITE_CONFIG.signMaxLength).join("")}…`
+            : text;
     }
 
     // 统计楼层号：存活数、最大楼号、缺失（被删/被吞）的楼号
@@ -1551,7 +1655,7 @@
     function buildLiteText(result) {
         const threadBlock = result && result.threads && result.threads[0];
         if (!threadBlock) {
-            return "LITE 1.1|empty";
+            return `LITE ${LITE_VERSION}|empty`;
         }
 
         const thread = threadBlock.thread || {};
@@ -1559,46 +1663,90 @@
         const posts = threadBlock.posts || [];
         const users = threadBlock.users || [];
 
-        const nameById = new Map();
-        const nameByAccount = new Map();
-        const ipById = new Map();
-        const rememberUser = (user) => {
-            if (!user || !user.id) {
-                return;
-            }
-            const name = user.nickname || user.username || `用户${user.id}`;
-            nameById.set(user.id, name);
-            if (user.username) {
-                nameByAccount.set(user.username, name);
-            }
-            if (user.ip) {
-                ipById.set(user.id, user.ip);
-            }
-        };
-
-        users.forEach(rememberUser);
-        for (const post of posts) {
-            rememberUser(post.user);
-            for (const comment of post.comments || []) {
-                rememberUser(comment.user);
-            }
-        }
-
-        let author = nameById.get(thread.user_id) || "";
-        if (!author) {
-            const firstFloor = posts.find((post) => post.floor === 1);
-            author = firstFloor && firstFloor.user
-                ? firstFloor.user.nickname || firstFloor.user.username || ""
-                : "";
-        }
-
         const cleanField = (value) =>
             String(value == null ? "" : value).replace(/\|/g, "｜").replace(/\s+/g, " ").trim();
 
+        // ---- 用户信息：顶层 users 为主，楼层/楼中楼里的 user 补缺（昵称、本吧等级、IP 属地） ----
+        const infoById = new Map();
+        const learnUser = (user) => {
+            if (!user || !user.id) {
+                return;
+            }
+            let info = infoById.get(user.id);
+            if (!info) {
+                info = { nick: "", account: "", level: 0, ip: "" };
+                infoById.set(user.id, info);
+            }
+            info.nick = info.nick || user.nickname || "";
+            info.account = info.account || user.username || "";
+            info.level = info.level || user.level || 0;
+            info.ip = info.ip || user.ip || "";
+        };
+        users.forEach(learnUser);
+        for (const post of posts) {
+            learnUser(post.user);
+            for (const comment of post.comments || []) {
+                learnUser(comment.user);
+            }
+        }
+
+        const nameByAccount = new Map();
+        for (const info of infoById.values()) {
+            if (info.account) {
+                nameByAccount.set(info.account, info.nick || info.account);
+            }
+        }
+
+        const nameOf = (userId) => {
+            const info = infoById.get(userId);
+            return (info && (info.nick || info.account)) || `用户${userId}`;
+        };
+        const ipOf = (userId) => {
+            const info = infoById.get(userId);
+            return cleanField((info && info.ip) || "") || "-";
+        };
+
+        // ---- 楼主 ----
+        let opId = thread.user_id || 0;
+        if (!opId) {
+            const firstFloor = posts.find((post) => post.floor === 1);
+            opId = firstFloor ? firstFloor.user_id : 0;
+        }
+        const opInfo = infoById.get(opId);
+        const opName = opInfo ? opInfo.nick || opInfo.account : "";
+        const opNames = new Set([opName, opInfo && opInfo.account].filter(Boolean));
+        const isOp = (userId, flag) => !!flag || (!!opId && userId === opId);
+
+        const opMeta = [];
+        if (opInfo && opInfo.level) {
+            opMeta.push(`Lv${opInfo.level}`);
+        }
+        if (opInfo && opInfo.ip) {
+            opMeta.push(cleanField(opInfo.ip));
+        }
+        const opField = opName ? `${cleanField(opName)}${opMeta.length ? `[${opMeta.join(",")}]` : ""}` : "-";
+
+        // 楼主一律写 [OP]；其他人写 昵称[LvN]
+        const userLabel = (userId, opFlag) => {
+            if (isOp(userId, opFlag)) {
+                return "[OP]";
+            }
+            const info = infoById.get(userId);
+            const level = info && info.level ? `[Lv${info.level}]` : "";
+            return `${cleanField(nameOf(userId))}${level}`;
+        };
+
+        // ---- 时间：省略与创建时间同年的年份 ----
+        const createdText = formatLiteTime(thread.create_time);
+        let baseYear = createdText !== "-" ? createdText.slice(0, 4) : "";
+        if (!baseYear) {
+            const timed = posts.find((post) => post.create_time);
+            baseYear = timed ? formatLiteTime(timed.create_time).slice(0, 4) : "";
+        }
+        const fmtTime = (timestamp) => formatLiteTime(timestamp, baseYear);
+
+        // ---- 表头 ----
         const tid = threadBlock.tid || (result.scrape_info && result.scrape_info.main_thread) || 0;
-        const forumName = cleanField(forum.name);
-        const title = cleanField(thread.title);
-        const created = formatLiteTime(thread.create_time);
         const totalReplies = posts.reduce(
             (sum, post) => sum + (post.comments ? post.comments.length : 0),
             0,
@@ -1615,49 +1763,74 @@
         const floorsField =
             floorInfo.max > floorInfo.count ? `${floorInfo.count}(max:${floorInfo.max})` : String(posts.length);
 
-        let header =
-            `LITE 1.1|tid=${tid}|forum=${forumName}|title=${title}|author=${cleanField(author)}|` +
-            `created=${created}|floors=${floorsField}|replies=${totalReplies}|tz=+08`;
+        const headerParts = [
+            `LITE ${LITE_VERSION}`,
+            `tid=${tid}`,
+            `forum=${cleanField(forum.name)}`,
+            `title=${cleanField(thread.title)}`,
+            `op=${opField}`,
+            `created=${createdText}`,
+            "tz=+08",
+        ];
+        if (thread.view_num > 0) {
+            headerParts.push(`views=${thread.view_num}`);
+        }
+        const threadLikes = likesField(thread.agree, thread.disagree);
+        if (threadLikes !== "-") {
+            headerParts.push(`likes=${threadLikes}`);
+        }
+        if (thread.share_num > 0) {
+            headerParts.push(`shares=${thread.share_num}`);
+        }
+        headerParts.push(`floors=${floorsField}`, `replies=${totalReplies}`);
         if (floorInfo.missing.length) {
-            header += `|missing=${formatFloorRanges(floorInfo.missing)}`;
+            headerParts.push(`missing=${formatFloorRanges(floorInfo.missing)}`);
         }
         if (stats.partial) {
-            header += "|partial=1";
+            headerParts.push("partial=1");
         }
         if (stats.failed_pages && stats.failed_pages.length) {
-            header += `|failed_pages=${stats.failed_pages.join(",")}`;
+            headerParts.push(`failed_pages=${stats.failed_pages.join(",")}`);
         }
         if (stats.error_count) {
-            header += `|errors=${stats.error_count}`;
+            headerParts.push(`errors=${stats.error_count}`);
         }
 
         const lines = [
-            header,
+            headerParts.join("|"),
             "format: #floor|user|time|ip|likes|text ; >n|user|time|ip|likes|to|text " +
-            "(n=sub-reply index, sorted by time ASC) ; [OP]=thread author ; " +
-            "missing=deleted/skipped floor numbers (failed_pages=fetch failed, not deleted) ; " +
-            "markers [img][vid][voice][emoji:x][link:t] ; \\n=newline",
+            "(n=sub-reply index, sorted by time ASC) ; user=name[LvN] (LvN=forum level, omitted if unknown) ; " +
+            "[OP]=thread author (name in header op=[Lv,ip]) ; @[OP]=reply to OP ; " +
+            "time=MM-DD HH:mm (year omitted = same year as created) ; likes=+up/-down (0/-n = only down, -=none) ; " +
+            "markers [img:id] (same id=same image) [line]=divider image [vid][voice][emoji:x][link:t] ; " +
+            "[sign:s]=signature (shown at that user's first appearance only) ; " +
+            "missing=deleted/skipped floor numbers (failed_pages=fetch failed, not deleted) ; \\n=newline",
             "",
         ];
 
-        const likesField = (agree) => (agree > 0 ? `+${agree}` : "-");
+        const hashLength = pickImageHashLength(posts);
+        const seenSigns = new Set();
 
         for (const post of posts) {
-            const userName =
-                nameById.get(post.user_id) ||
-                (post.user && (post.user.nickname || post.user.username)) ||
-                `用户${post.user_id}`;
-            const ip = (post.user && post.user.ip) || ipById.get(post.user_id) || "-";
-            const content = renderLiteContent(post.contents);
-            const opMark = post.is_thread_author ? "[OP]" : "";
+            let body = renderLiteContent(post.contents, hashLength);
+
+            const sign = cleanSign(post.sign);
+            if (sign) {
+                const key = `${post.user_id}\u0000${sign}`;
+                if (!seenSigns.has(key)) {
+                    seenSigns.add(key);
+                    body = body === "-" ? `[sign:${sign}]` : `${body}[sign:${sign}]`;
+                }
+            }
+
             lines.push(
-                `#${post.floor}|${cleanField(userName)}${opMark}|${formatLiteTime(post.create_time)}|${cleanField(ip)}|${likesField(post.agree)}|${content}`,
+                `#${post.floor}|${userLabel(post.user_id, post.is_thread_author)}|${fmtTime(post.create_time)}|${ipOf(post.user_id)}|${likesField(post.agree, post.disagree)}|${body}`,
             );
 
             // 导出前再保险排序一次，保证楼中楼严格按时间正序
             const comments = [...(post.comments || [])].sort(compareByTime);
             comments.forEach((comment, index) => {
-                let commentContent = renderLiteContent(comment.contents);
+                let commentContent = renderLiteContent(comment.contents, hashLength);
                 let prefixTarget = null;
                 const matched = commentContent.match(/^回复\s*([^\n:：]{1,40})[:：]\s*/);
                 if (matched) {
@@ -1666,19 +1839,21 @@
                 }
 
                 const replyToId = comment.reply_to_id || 0;
-                const target = replyToId
-                    ? nameById.get(replyToId)
-                    : nameByAccount.get(prefixTarget) || prefixTarget;
-                const targetField = target ? `@${cleanField(target)}` : "-";
-                const commentUser =
-                    nameById.get(comment.user_id) ||
-                    (comment.user && (comment.user.nickname || comment.user.username)) ||
-                    `用户${comment.user_id}`;
-                const commentIp =
-                    (comment.user && comment.user.ip) || ipById.get(comment.user_id) || "-";
-                const commentOp = comment.is_thread_author ? "[OP]" : "";
+                let targetField = "-";
+                if (replyToId) {
+                    targetField = isOp(replyToId, false)
+                        ? "@[OP]"
+                        : `@${cleanField(nameOf(replyToId))}`;
+                } else if (prefixTarget) {
+                    const resolved = nameByAccount.get(prefixTarget) || prefixTarget;
+                    targetField =
+                        opNames.has(prefixTarget) || opNames.has(resolved)
+                            ? "@[OP]"
+                            : `@${cleanField(resolved)}`;
+                }
+
                 lines.push(
-                    `>${index + 1}|${cleanField(commentUser)}${commentOp}|${formatLiteTime(comment.create_time)}|${cleanField(commentIp)}|${likesField(comment.agree)}|${targetField}|${commentContent}`,
+                    `>${index + 1}|${userLabel(comment.user_id, comment.is_thread_author)}|${fmtTime(comment.create_time)}|${ipOf(comment.user_id)}|${likesField(comment.agree, comment.disagree)}|${targetField}|${commentContent}`,
                 );
             });
         }
