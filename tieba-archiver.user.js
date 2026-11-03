@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         贴吧存档助手（TiebaArchiver 浏览器版）
 // @namespace    tieba-archiver-browser
-// @version      1.4.0
+// @version      1.5.0
 // @description  在贴吧帖子页抓取主题帖、全部楼层与楼中楼，导出为完整 JSON 或用于 AI 分析的 Lite 文本
 // @author       tieba-ex
 // @match        https://tieba.baidu.com/p/*
@@ -30,12 +30,18 @@
  * - 使用与 TiebaArchiver 相同的 protobuf 客户端接口，抓取全部楼层与楼中楼。
  * - 不下载图片/视频/语音/头像，仅在 JSON 中保留原始链接与元数据。
  * - 输出为单个 JSON，结构对应原工具的 threads/<tid>/ 目录（thread.json、forum.json、post 表、user 表）。
+ *
+ * 1.5.0 更新：
+ * - 楼中楼在 JSON 与 Lite 中统一按时间正序（修复：首页内联的楼中楼原为按赞排序，未经重排）。
+ * - Lite 1.1：楼中楼增加序号与点赞数；楼主标 [OP]；
+ *   表头 floors=存活楼层数(max:最大楼号)，并用 missing= 列出缺失（被删/被吞）的楼号；
+ *   抓取失败的页码记入 failed_pages，避免把网络失败误判为被删楼层。
  */
 
 (() => {
     "use strict";
 
-    const APP_VERSION = "browser-1.4.0";
+    const APP_VERSION = "browser-1.5.0";
     const APP_HOST = "https://tiebac.baidu.com";
     const BOUNDARY = "-*_r1999";
     const PAGE_CMD = 302001;
@@ -889,6 +895,24 @@
         };
     }
 
+    // 楼中楼统一按时间正序（时间相同则按 id），避免按赞/热度排序造成时间线错乱
+    function compareByTime(a, b) {
+        return (a.create_time || 0) - (b.create_time || 0) || (a.id || 0) - (b.id || 0);
+    }
+
+    function sortCommentsAsc(list) {
+        return list.sort(compareByTime);
+    }
+
+    // 首页内联的楼中楼是按赞排序的：转换后必须重新按时间排序
+    function inlineToComments(post) {
+        return sortCommentsAsc(
+            (post._inline || []).map((comment) =>
+                normalizeComment(comment, post, scraper.thread.authorId, scraper.users),
+            ),
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // 网络
     // ---------------------------------------------------------------------------
@@ -1104,6 +1128,7 @@
         forum: null,
         thread: null,
         errors: [],
+        failedPages: [],
         fatal: "",
         result: null,
         lastExport: null,
@@ -1215,6 +1240,7 @@
                 if (isCancelled(error)) {
                     throw error;
                 }
+                scraper.failedPages.push(pn);
                 recordError(`第 ${pn} 页：${error.message}`);
                 log(`第 ${pn} 页抓取失败：${error.message}`, "error");
             } finally {
@@ -1260,8 +1286,7 @@
             pn += 1;
         }
 
-        collected.sort((a, b) => a.create_time - b.create_time || a.id - b.id);
-        return collected;
+        return sortCommentsAsc(collected);
     }
 
     async function scrapeComments() {
@@ -1286,9 +1311,7 @@
                 }
                 recordError(`楼层 ${post.floor}(${post.id}) 楼中楼：${error.message}`);
                 log(`楼层 ${post.floor} 楼中楼抓取失败：${error.message}`, "error");
-                post.comments = post._inline.map((comment) =>
-                    normalizeComment(comment, post, scraper.thread.authorId, scraper.users),
-                );
+                post.comments = inlineToComments(post);
             } finally {
                 if (!scraper.cancelled) {
                     scraper.comment.done += 1;
@@ -1303,9 +1326,9 @@
 
         for (const post of floors) {
             if (!post.comments || post.comments.length === 0) {
-                post.comments = (post._inline || []).map((comment) =>
-                    normalizeComment(comment, post, scraper.thread.authorId, scraper.users),
-                );
+                post.comments = inlineToComments(post);
+            } else {
+                sortCommentsAsc(post.comments);
             }
             delete post._inline;
             for (const comment of post.comments) {
@@ -1364,9 +1387,10 @@
                 post._inline.length &&
                 scraper.thread
             ) {
-                post.comments = post._inline.map((comment) =>
-                    normalizeComment(comment, post, scraper.thread.authorId, scraper.users),
-                );
+                post.comments = inlineToComments(post);
+            }
+            if (post.comments && post.comments.length > 1) {
+                sortCommentsAsc(post.comments);
             }
             delete post._inline;
         });
@@ -1393,6 +1417,7 @@
                 comment_count: countComments(),
                 user_count: scraper.users.size,
                 error_count: scraper.errors.length,
+                failed_pages: [...scraper.failedPages].sort((a, b) => a - b),
                 partial: !!partial,
             },
             errors: scraper.errors.slice(0, 100),
@@ -1484,10 +1509,49 @@
         return sanitizeLiteText(text);
     }
 
+    // 统计楼层号：存活数、最大楼号、缺失（被删/被吞）的楼号
+    function analyzeFloors(posts) {
+        const present = new Set();
+        let max = 0;
+        for (const post of posts) {
+            if (post.floor > 0) {
+                present.add(post.floor);
+                if (post.floor > max) {
+                    max = post.floor;
+                }
+            }
+        }
+        const missing = [];
+        for (let floor = 1; floor <= max; floor += 1) {
+            if (!present.has(floor)) {
+                missing.push(floor);
+            }
+        }
+        return { count: present.size, max, missing };
+    }
+
+    // [55,56,66,72,75] -> "55-56,66,72,75"；过长时截断，避免头部膨胀
+    function formatFloorRanges(floors, maxParts = 60) {
+        const parts = [];
+        let i = 0;
+        while (i < floors.length) {
+            let j = i;
+            while (j + 1 < floors.length && floors[j + 1] === floors[j] + 1) {
+                j += 1;
+            }
+            parts.push(i === j ? String(floors[i]) : `${floors[i]}-${floors[j]}`);
+            i = j + 1;
+        }
+        if (parts.length > maxParts) {
+            return `${parts.slice(0, maxParts).join(",")},…`;
+        }
+        return parts.join(",");
+    }
+
     function buildLiteText(result) {
         const threadBlock = result && result.threads && result.threads[0];
         if (!threadBlock) {
-            return "LITE 1.0|empty";
+            return "LITE 1.1|empty";
         }
 
         const thread = threadBlock.thread || {};
@@ -1545,11 +1609,23 @@
             result.scrape_info.scrape_records &&
             result.scrape_info.scrape_records[0];
         const stats = (record && record.stats) || {};
+
+        // floors=存活楼层数；有缺口时追加 (max:最大楼号) 与 missing=缺失楼号
+        const floorInfo = analyzeFloors(posts);
+        const floorsField =
+            floorInfo.max > floorInfo.count ? `${floorInfo.count}(max:${floorInfo.max})` : String(posts.length);
+
         let header =
-            `LITE 1.0|tid=${tid}|forum=${forumName}|title=${title}|author=${cleanField(author)}|` +
-            `created=${created}|floors=${posts.length}|replies=${totalReplies}|tz=+08`;
+            `LITE 1.1|tid=${tid}|forum=${forumName}|title=${title}|author=${cleanField(author)}|` +
+            `created=${created}|floors=${floorsField}|replies=${totalReplies}|tz=+08`;
+        if (floorInfo.missing.length) {
+            header += `|missing=${formatFloorRanges(floorInfo.missing)}`;
+        }
         if (stats.partial) {
             header += "|partial=1";
+        }
+        if (stats.failed_pages && stats.failed_pages.length) {
+            header += `|failed_pages=${stats.failed_pages.join(",")}`;
         }
         if (stats.error_count) {
             header += `|errors=${stats.error_count}`;
@@ -1557,10 +1633,14 @@
 
         const lines = [
             header,
-            "format: #floor|user|time|ip|likes|text ; >reply|user|time|ip|to|text ; " +
+            "format: #floor|user|time|ip|likes|text ; >n|user|time|ip|likes|to|text " +
+            "(n=sub-reply index, sorted by time ASC) ; [OP]=thread author ; " +
+            "missing=deleted/skipped floor numbers (failed_pages=fetch failed, not deleted) ; " +
             "markers [img][vid][voice][emoji:x][link:t] ; \\n=newline",
             "",
         ];
+
+        const likesField = (agree) => (agree > 0 ? `+${agree}` : "-");
 
         for (const post of posts) {
             const userName =
@@ -1568,19 +1648,21 @@
                 (post.user && (post.user.nickname || post.user.username)) ||
                 `用户${post.user_id}`;
             const ip = (post.user && post.user.ip) || ipById.get(post.user_id) || "-";
-            const likes = post.agree > 0 ? `+${post.agree}` : "-";
             const content = renderLiteContent(post.contents);
+            const opMark = post.is_thread_author ? "[OP]" : "";
             lines.push(
-                `#${post.floor}|${cleanField(userName)}|${formatLiteTime(post.create_time)}|${cleanField(ip)}|${likes}|${content}`,
+                `#${post.floor}|${cleanField(userName)}${opMark}|${formatLiteTime(post.create_time)}|${cleanField(ip)}|${likesField(post.agree)}|${content}`,
             );
 
-            for (const comment of post.comments || []) {
-                let content = renderLiteContent(comment.contents);
+            // 导出前再保险排序一次，保证楼中楼严格按时间正序
+            const comments = [...(post.comments || [])].sort(compareByTime);
+            comments.forEach((comment, index) => {
+                let commentContent = renderLiteContent(comment.contents);
                 let prefixTarget = null;
-                const matched = content.match(/^回复\s*([^\n:：]{1,40})[:：]\s*/);
+                const matched = commentContent.match(/^回复\s*([^\n:：]{1,40})[:：]\s*/);
                 if (matched) {
                     prefixTarget = matched[1].trim().replace(/^[@＠]/, "");
-                    content = content.slice(matched[0].length).trim() || "-";
+                    commentContent = commentContent.slice(matched[0].length).trim() || "-";
                 }
 
                 const replyToId = comment.reply_to_id || 0;
@@ -1594,10 +1676,11 @@
                     `用户${comment.user_id}`;
                 const commentIp =
                     (comment.user && comment.user.ip) || ipById.get(comment.user_id) || "-";
+                const commentOp = comment.is_thread_author ? "[OP]" : "";
                 lines.push(
-                    `>|${cleanField(commentUser)}|${formatLiteTime(comment.create_time)}|${cleanField(commentIp)}|${targetField}|${content}`,
+                    `>${index + 1}|${cleanField(commentUser)}${commentOp}|${formatLiteTime(comment.create_time)}|${cleanField(commentIp)}|${likesField(comment.agree)}|${targetField}|${commentContent}`,
                 );
-            }
+            });
         }
 
         return lines.join("\n");
@@ -1676,6 +1759,7 @@
         scraper.forum = null;
         scraper.thread = null;
         scraper.errors = [];
+        scraper.failedPages = [];
         scraper.fatal = "";
         scraper.result = null;
         scraper.lastExport = null;
