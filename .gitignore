@@ -1,0 +1,13 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor & IDE
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Temp & logs
+*.log
+*.tmp
